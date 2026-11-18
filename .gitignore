@@ -3,3 +3,10 @@ claude_desktop_config.json
 whatsapp.logwhatsapp-bridge/bridge.log
 whatsapp-bridge/qr.*
 whatsapp-bridge/whatsapp-bridge
+
+whatsapp-bridge/*.log
+whatsapp-bridge/*.bak-*
+whatsapp-bridge/send-tmp/
+whatsapp-bridge/store/
+whatsapp-bridge/whatsapp-*.old-*
+whatsapp-bridge/whatsapp-client

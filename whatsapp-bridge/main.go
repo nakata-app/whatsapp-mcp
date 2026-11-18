@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"strconv"
 	"os/signal"
 	"path/filepath"
 	"reflect"
@@ -204,7 +206,37 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+// recipientAllowed reports whether sends are permitted to this recipient.
+// The list is deliberately a file, not a constant: Atakan edits it, we do not.
+func recipientAllowed(recipient string) bool {
+	const listPath = "/Users/macmini/.svelka/sonji-ft/gonderim-allowlist.json"
+	raw, err := os.ReadFile(listPath)
+	if err != nil {
+		return false
+	}
+	var list struct {
+		Allowed []string `json:"allowed"`
+	}
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return false
+	}
+	// Normalise: 272451317571737@lid == 272451317571737
+	normalise := func(v string) string {
+		if i := strings.LastIndex(v, "@"); i > 0 {
+			return v[:i]
+		}
+		return v
+	}
+	want := normalise(recipient)
+	for _, a := range list.Allowed {
+		if normalise(a) == want {
+			return true
+		}
+	}
+	return false
+}
+
+func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string, logger waLog.Logger) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -218,7 +250,22 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	if isJID {
 		// Parse the JID string
+		// Accept a full JID ("<digits>@lid" / "@s.whatsapp.net" / "@g.us") as-is; a bare
+		// number keeps the old phone-number path. Passing a raw LID with the phone
+		// suffix made whatsmeow report "no LID found for 272451317571737@s.whatsapp.net".
+		if i := strings.LastIndex(recipient, "@"); i > 0 {
+			recipientJID = types.NewJID(recipient[:i], recipient[i+1:])
+		} else {
+			// Recipients outside the allowlist are refused before anything is sent: sending
+		// a voice note to a group or to the wrong person is not recoverable by the user
+		// on our side, and it happened twice (2026-09-29).
+		if !recipientAllowed(recipient) {
+			logger.Warnf("gonderim engellendi, alici izinli degil: %s", recipient)
+			return false, fmt.Sprintf("alici izinli degil: %s", recipient)
+		}
+
 		recipientJID, err = types.ParseJID(recipient)
+		}
 		if err != nil {
 			return false, fmt.Sprintf("Error parsing JID: %v", err)
 		}
@@ -278,6 +325,15 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			mimeType = "video/quicktime"
 
 		// Document types (for any other file type)
+		case "wav":
+			mediaType = whatsmeow.MediaAudio
+			mimeType = "audio/wav"
+		case "mp3":
+			mediaType = whatsmeow.MediaAudio
+			mimeType = "audio/mpeg"
+		case "m4a":
+			mediaType = whatsmeow.MediaAudio
+			mimeType = "audio/mp4"
 		default:
 			mediaType = whatsmeow.MediaDocument
 			mimeType = "application/octet-stream"
@@ -519,9 +575,13 @@ type MediaDownloader struct {
 	MediaType     whatsmeow.MediaType
 }
 
-// GetDirectPath implements the DownloadableMessage interface
+// GetDirectPath implements the DownloadableMessage interface.
+//
+// whatsmeow appends the hash itself, but only as "&hash=..." to whatever this
+// returns. Passing the bare CDN path made the request unsigned (404/403), so
+// the signed query and the padded base64 encFileHash are both kept here.
 func (d *MediaDownloader) GetDirectPath() string {
-	return d.DirectPath
+	return d.DirectPath + "&hash=" + base64.URLEncoding.EncodeToString(d.FileEncSHA256)
 }
 
 // GetURL implements the DownloadableMessage interface
@@ -669,16 +729,53 @@ func extractDirectPathFromURL(url string) string {
 
 	pathPart := parts[1]
 
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
+	// Keep the signed query (ccb/oh/oe) that WhatsApp attached: whatsmeow rebuilds
+	// the request as host + directPath + "&hash=...", so the signature has to survive.
+	// Dropping it makes the CDN answer 404 and downloadMedia fail with 403.
 	return "/" + pathPart
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
 	// Handler for sending messages
+	// Revoke a message that was sent to the wrong recipient.
+	http.HandleFunc("/api/revoke", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			ChatJID    string `json:"chat_jid"`
+			MessageID  string `json:"message_id"`
+			ForEveryone bool   `json:"for_everyone"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.ChatJID == "" || req.MessageID == "" {
+			http.Error(w, "Chat JID and Message ID are required", http.StatusBadRequest)
+			return
+		}
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			http.Error(w, "Invalid chat JID", http.StatusBadRequest)
+			return
+		}
+		resp, err := client.RevokeMessage(context.Background(), chatJID, types.MessageID(req.MessageID))
+		if err != nil {
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to revoke: %v", err),
+			})
+			return
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{
+			Success: true,
+			Message: fmt.Sprintf("Revoked %s (server id: %s)", req.MessageID, resp.ID),
+		})
+	})
+
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
@@ -707,7 +804,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath, waLog.Noop)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -927,7 +1024,26 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	// Port çakışması: 8080 başka bir uygulama (Wi-Fi Doppler radar) tarafından
+	// IPv4+::1 üzerinde tutuluyordu; bridge *:8080'e bağlanıp ulaşılamaz kalıyordu.
+	// Kalıcı fix: portu ortam değişkeniyle ver, varsayılan 8080 (geriye uyumlu).
+	port := 8080
+	// CLI: --port 8090 (launchd EnvironmentVariables'a güvenmek yerine açık argüman)
+	for i, a := range os.Args {
+		if a == "--port" && i+1 < len(os.Args) {
+			if n, err := strconv.Atoi(os.Args[i+1]); err == nil && n > 0 && n < 65536 {
+				port = n
+			}
+		}
+	}
+	if v := os.Getenv("WHATSAPP_BRIDGE_PORT"); v != "" && port == 8080 {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n < 65536 {
+			port = n
+		} else {
+			logger.Warnf("geçersiz WHATSAPP_BRIDGE_PORT=%q, 8080 kullanılacak", v)
+		}
+	}
+	startRESTServer(client, messageStore, port)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
