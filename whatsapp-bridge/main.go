@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/binary"
@@ -220,14 +221,23 @@ func recipientAllowed(recipient string) bool {
 	if err := json.Unmarshal(raw, &list); err != nil {
 		return false
 	}
-	// Normalise: 272451317571737@lid == 272451317571737
 	normalise := func(v string) string {
+		v = strings.TrimSpace(v)
 		if i := strings.LastIndex(v, "@"); i > 0 {
 			return v[:i]
 		}
 		return v
 	}
-	want := normalise(recipient)
+	trimmed := strings.TrimSpace(recipient)
+	if strings.HasSuffix(trimmed, "@g.us") {
+		for _, a := range list.Allowed {
+			if strings.TrimSpace(a) == trimmed {
+				return true
+			}
+		}
+		return false
+	}
+	want := normalise(trimmed)
 	for _, a := range list.Allowed {
 		if normalise(a) == want {
 			return true
@@ -239,6 +249,14 @@ func recipientAllowed(recipient string) bool {
 func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string, logger waLog.Logger) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
+	}
+
+	// Recipients outside the allowlist are refused before anything is sent, regardless
+	// of whether recipient is a full JID (@lid/@s.whatsapp.net/@g.us) or a bare number.
+	if !recipientAllowed(recipient) {
+		fmt.Printf("[SECURITY] gonderim engellendi, alici izinli degil: %s\n", recipient)
+		logger.Warnf("gonderim engellendi, alici izinli degil: %s", recipient)
+		return false, fmt.Sprintf("alici izinli degil: %s", recipient)
 	}
 
 	// Create JID for recipient
@@ -256,15 +274,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		if i := strings.LastIndex(recipient, "@"); i > 0 {
 			recipientJID = types.NewJID(recipient[:i], recipient[i+1:])
 		} else {
-			// Recipients outside the allowlist are refused before anything is sent: sending
-		// a voice note to a group or to the wrong person is not recoverable by the user
-		// on our side, and it happened twice (2026-09-29).
-		if !recipientAllowed(recipient) {
-			logger.Warnf("gonderim engellendi, alici izinli degil: %s", recipient)
-			return false, fmt.Sprintf("alici izinli degil: %s", recipient)
-		}
-
-		recipientJID, err = types.ParseJID(recipient)
+			recipientJID, err = types.ParseJID(recipient)
 		}
 		if err != nil {
 			return false, fmt.Sprintf("Error parsing JID: %v", err)
@@ -735,18 +745,67 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
-// Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
-	// Handler for sending messages
+const defaultBridgeTokenPath = "/Users/macmini/.nakata/whatsapp-bridge.token"
+
+func loadBridgeToken() string {
+	if tok := strings.TrimSpace(os.Getenv("WHATSAPP_BRIDGE_TOKEN")); tok != "" {
+		return tok
+	}
+	tokenPath := strings.TrimSpace(os.Getenv("WHATSAPP_BRIDGE_TOKEN_FILE"))
+	if tokenPath == "" {
+		tokenPath = defaultBridgeTokenPath
+	}
+	raw, err := os.ReadFile(tokenPath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(raw))
+}
+
+func requireBridgeAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		expected := loadBridgeToken()
+		if expected == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: "bridge auth token not configured",
+			})
+			return
+		}
+		provided := strings.TrimSpace(r.Header.Get("X-Bridge-Token"))
+		if provided == "" {
+			auth := strings.TrimSpace(r.Header.Get("Authorization"))
+			if len(auth) > 7 && strings.EqualFold(auth[:7], "Bearer ") {
+				provided = strings.TrimSpace(auth[7:])
+			}
+		}
+		if len(provided) != len(expected) || subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
+			fmt.Printf("[SECURITY] unauthorized REST API request: %s %s from %s\n", r.Method, r.URL.Path, r.RemoteAddr)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: "unauthorized",
+			})
+			return
+		}
+		next(w, r)
+	}
+}
+
+func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore) *http.ServeMux {
+	mux := http.NewServeMux()
 	// Revoke a message that was sent to the wrong recipient.
-	http.HandleFunc("/api/revoke", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/revoke", requireBridgeAuth(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		var req struct {
-			ChatJID    string `json:"chat_jid"`
-			MessageID  string `json:"message_id"`
+			ChatJID     string `json:"chat_jid"`
+			MessageID   string `json:"message_id"`
 			ForEveryone bool   `json:"for_everyone"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -774,9 +833,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Success: true,
 			Message: fmt.Sprintf("Revoked %s (server id: %s)", req.MessageID, resp.ID),
 		})
-	})
+	}))
 
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/send", requireBridgeAuth(func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -819,10 +878,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Success: success,
 			Message: message,
 		})
-	})
+	}))
 
 	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/download", requireBridgeAuth(func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -870,15 +929,22 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Filename: filename,
 			Path:     path,
 		})
-	})
+	}))
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	return mux
+}
+
+// Start a REST API server to expose the WhatsApp client functionality
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	mux := newRESTMux(client, messageStore)
+
+	// Start the server (localhost only — never expose send/revoke API to LAN/Tailscale)
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := http.ListenAndServe(serverAddr, mux); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
